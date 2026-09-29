@@ -6,6 +6,10 @@ pulse shape, width, rate and polarity set live by the host. Driven by the
 [PlaStim foc312 engine](https://github.com/plastim/foc312-engine) (PC) and the
 [foc312 M5 remote](https://github.com/plastim/foc312-m5remote). The stock modes are unchanged: restim still works.
 
+> **Start here:** install the PC app with its
+> **[installation guide](https://github.com/plastim/foc312-engine/blob/main/INSTALL.md)**. It flashes this firmware
+> onto your box for you (signed releases, checked before flashing). You don't need anything from this repository.
+
 ## What this fork adds
 
 - **Two-channel biphasic pulses** (`OUTPUT_BIPHASIC_PAIRS`): channel A and B each on any electrode pair, any
