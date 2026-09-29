@@ -838,6 +838,9 @@ static void biphasic_loop(float vbus, float &v_boost_min, float &v_boost_max)
         protobuf.transmit_notification_debug_teleplot("bp_any_start", float(biphasic.any_start_count));
         protobuf.transmit_notification_debug_teleplot("bp_any_other", float(biphasic.any_other_count));
         protobuf.transmit_notification_debug_teleplot("bp_rev_seed", float(biphasic.reverse_seed_count));
+        protobuf.transmit_notification_debug_teleplot("bp_trim", float(biphasic.trim_count));
+        protobuf.transmit_notification_debug_teleplot("bp_k_a", biphasic.diag_trim[0]);
+        protobuf.transmit_notification_debug_teleplot("bp_k_b", biphasic.diag_trim[1]);
     }
     if (pulse_counter % 50 == 40) {
         protobuf.transmit_notification_signal_stats(

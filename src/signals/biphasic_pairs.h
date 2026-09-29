@@ -112,6 +112,30 @@ public:
     uint32_t any_lead_count = 0, any_return_count = 0, any_start_count = 0, any_other_count = 0;
     uint32_t reverse_seed_count = 0;    // v8: directions started from their reverse (telemetry)
 
+    // v9 PREDICTIVE peak guard. v6/v7 correct the estimate AFTER a pulse, for the amplitude and width just played; a
+    // rising amplitude, a jump to another width bin or a shape switch gets there first (box 2, PlaStim, dry pads,
+    // 2026-09-29: taper 0.4 at 0.46 A tripped at 1.27x, a swinging soft-square pattern at 1.46x; the stock rule
+    // allows 1 + 0.12 / a1, only 1.26 at 0.46 A, and on skin the settled sensed/command ratio is ~1.25-1.29 for every
+    // shape). Per route x width bin x shape class the box learns G = the largest sensed current per volt of peak
+    // drive (up at once, down by G_DECAY per pulse; a key never measured starts from the route's largest G x
+    // G_SEED_MARGIN, else from G0_RATIO x the command at the model's drive, and takes its first measurement as it
+    // is). Before each pulse the DRIVE (not the command, not the e-stop limit) is scaled by
+    //     k = min(1, V9_HOLD x (e-stop limit - GUARD_TRIP_FRAC x margin) / (G x planned peak drive))
+    // as the v6/v7 guard trims it through the estimate. On a trimmed pulse the charge adaptation may lower the
+    // estimate but not raise it. Designed in sim/v9_sim.py: 0 trips where v8 tripped 1-20 times, the same charge.
+    static constexpr int NSHAPE_CLASSES = 3;   // rounded (and taper <= 0.1), triangle, steep (soft, square, taper)
+    static constexpr float V9_HOLD = 0.95f;
+    static constexpr float G_DECAY = 0.05f;
+    static constexpr float G_SEED_MARGIN = 1.5f;
+    static constexpr float G0_RATIO = 1.5f;
+    static int shape_class(int shape, float param) {
+        if (shape == SHAPE_ROUNDED || (shape == SHAPE_TAPER && param <= 0.1f)) return 0;
+        if (shape == SHAPE_TRIANGLE) return 1;
+        return 2;
+    }
+    uint32_t trim_count = 0;           // v9: pulses the predictive guard trimmed (telemetry)
+    float diag_trim[2]{1, 1};          // v9: per channel, smoothed trim factor k (1 = untouched)
+
     // v3: the estimate is WIDTH-AWARE. Skin is partly capacitive, so the loop "resistance" a pulse sees rises
     // with its width; one number per pair (v1/v2) learned on wide pulses over-drove narrow ones after a width
     // jump (over-current e-stop on PlaStim's leg, 2026-09-26). Each pair keeps NBINS estimates at log-spaced widths
@@ -174,6 +198,12 @@ private:
     float cur_a1 = 0;               // commanded lead peak of the pulse being played, after limits (v6 guard)
     int cur_lead_e = 0;             // electrode that is cathodic in its lead phase (v6 guard)
     float cur_t1 = 0;               // lead width of the pulse being played, seconds (v5 sigma fit)
+    // v9: peak per volt per route x width bin x shape class; the key and trim of the pulse being played
+    float g_peak[NROUTES][NBINS][NSHAPE_CLASSES]{};
+    bool g_seen[NROUTES][NBINS][NSHAPE_CLASSES]{};
+    int cur_gbin = 0, cur_class = 0;
+    float cur_k = 1;                // the drive trim of this pulse (1 = untouched)
+    float cur_vpk = 0;              // its peak drive as played, volts (after limits and trim)
     // over-current trip report (written by the ISR on the tripping sample)
     float trip_current[4]{};
     int trip_sample = -1;

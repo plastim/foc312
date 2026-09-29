@@ -28,6 +28,10 @@ void BiphasicPairs::reset_routes()
             r_bin[r][b] = 2 * MODEL_RESISTANCE_MIN;
             sig_bin[r][b] = 0;
             bin_seen[r][b] = false;
+            for (int c = 0; c < NSHAPE_CLASSES; c++) {
+                g_peak[r][b][c] = 0;
+                g_seen[r][b][c] = false;
+            }
         }
         route_seen[r] = false;
         r_last[r] = 2 * MODEL_RESISTANCE_MIN;
@@ -274,6 +278,52 @@ void BiphasicPairs::play_pulse(int channel, PulseParams p, OutputLimits limits)
     stats.q_cmd_lead = a1 * sum1 / fs;
     stats.q_cmd_return = a2 * sum2 / fs;     // == q_cmd_lead (by construction, to float precision)
 
+    // --- v9 predictive peak guard (see the header): trim the DRIVE so this pulse's predicted sensed peak stays under
+    //     the guard's ceiling. The command i_cmd, and with it the e-stop limit, stay as requested; only v_cmd scales,
+    //     as the v6/v7 guard scales it through the estimate. Lowers only.
+    {
+        const int rt = route_index(ex, ey);
+        cur_class = shape_class(shape, sp);
+        int gb = 0;                                                    // the width bin nearest this pulse's width
+        float best = INFINITY;
+        for (int b = 0; b < NBINS; b++) {
+            float d = fabsf(logf(w1 / BIN_WIDTH[b]));
+            if (d < best) { best = d; gb = b; }
+        }
+        cur_gbin = gb;
+        const float vpk_plan = v_loop_max * scale;
+        float g = 0;
+        if (g_seen[rt][gb][cur_class]) {
+            g = g_peak[rt][gb][cur_class];
+        } else {
+            // not measured yet: the largest G of this direction, else of its reverse, times the seed margin
+            float gmax = 0;
+            for (int route : {rt, route_index(ey, ex)}) {
+                for (int b = 0; b < NBINS; b++)
+                    for (int c = 0; c < NSHAPE_CLASSES; c++)
+                        if (g_seen[route][b][c]) gmax = std::max(gmax, g_peak[route][b][c]);
+                if (gmax > 0) break;
+            }
+            g = gmax > 0 ? gmax * G_SEED_MARGIN : (vpk_plan > 0 ? G0_RATIO * a1 / vpk_plan : 0);
+        }
+        const float ceiling = std::min<float>(p.estop_current_limit, BSP_MaximumMeasurableCurrent())
+                              - GUARD_TRIP_FRAC * ESTOP_CURRENT_LIMIT_MARGIN;
+        float kk = 1;
+        if (g > 0 && vpk_plan > 0 && ceiling > 0) {
+            kk = std::min(1.f, V9_HOLD * ceiling / (g * vpk_plan));
+        }
+        if (kk < 1) {
+            for (int j = 0; j < n_samples; j++) {
+                for (int e = 0; e < 4; e++) v_cmd[j][e] *= kk;
+            }
+            trim_count++;
+        }
+        cur_k = kk;
+        cur_vpk = vpk_plan * kk;
+        diag_trim[channel & 1] = 0.9f * diag_trim[channel & 1] + 0.1f * kk;
+        stats.v_drive_actual = cur_vpk;
+    }
+
     // --- play
     for (int e = 0; e < 4; e++) stats.current_max[e] = 0;
     stats.v_bus_min = 99;
@@ -312,8 +362,8 @@ void BiphasicPairs::play_pulse(int channel, PulseParams p, OutputLimits limits)
                           trip_current[0], trip_current[1], trip_current[2], trip_current[3], trip_sample, n_samples);
         BSP_PrintDebugMsg("biphasic trip: cmd peak %.3f A primary, lead %.1f us, return %.1f us, shape %d (%.2f), route %d%d",
                           a1, w1 * 1e6f / fs, w2 * 1e6f / fs, shape, sp, ex + 1, ey + 1);
-        BSP_PrintDebugMsg("biphasic trip: r_est %.2f ohm, sigma %.2f (bin %d + %.2f), v_drive %.2f V, scale %.2f",
-                          rp, sig, cur_bin, cur_frac, stats.v_drive_actual, stats.amplitude_scale);
+        BSP_PrintDebugMsg("biphasic trip: r_est %.2f ohm, sigma %.2f (bin %d + %.2f), v_drive %.2f V, scale %.2f, trim %.2f",
+                          rp, sig, cur_bin, cur_frac, stats.v_drive_actual, stats.amplitude_scale, cur_k);
         emergency_stop_fn(FOCError::OUTPUT_OVER_CURRENT);
         while (1) {}
     }
@@ -432,7 +482,10 @@ void BiphasicPairs::model_update(int channel)
     // some magnetizing current, which errs toward a LOWER estimate (softer).
     float cmd = q_cmd[1];
     float meas = q_meas[1];
-    if (cmd > MIN_CURRENT_FOR_UPDATE * 2 && meas > 0) {
+    // v9: a trimmed pulse under-delivers on purpose; the adaptation may lower the estimate on it, not raise it
+    // (raising would climb back to undo the trim and leave an inflated estimate behind)
+    const bool climb_blocked = cur_k < 1 && cmd > 0 && meas < cmd;
+    if (cmd > MIN_CURRENT_FOR_UPDATE * 2 && meas > 0 && !climb_blocked) {
         diag_rho[channel & 1] = 0.9f * diag_rho[channel & 1] + 0.1f * (meas / cmd);
         float rho = std::clamp(meas / cmd, 0.5f, 2.f);
         // half step (stable with noisy, rise-limited pulses), shared between the two width bins in log space:
@@ -455,6 +508,16 @@ void BiphasicPairs::model_update(int channel)
     {
         float any_max = 0;
         for (int e = 0; e < 4; e++) any_max = std::max(any_max, stats.current_max[e]);
+        // v9: learn this route x width x shape's sensed peak per volt of peak drive (up at once, down slowly; a key
+        // seeded from a guess takes its first measurement as it is)
+        if (cur_vpk > 0 && any_max > 0) {
+            const int rt = route_index(ex, ey);
+            const float obs = any_max / cur_vpk;
+            float &gp = g_peak[rt][cur_gbin][cur_class];
+            bool &seen = g_seen[rt][cur_gbin][cur_class];
+            gp = (!seen || obs > gp) ? obs : gp + G_DECAY * (obs - gp);
+            seen = true;
+        }
         float lead_pk = 0;
         for (int k = 0; k < n_samples; k++) lead_pk = std::max(lead_pk, -i_meas[k][cur_lead_e]);
         // g_any / g_lead: how far this pulse's estimate could scale before each ceiling (currents are linear in it)
@@ -492,7 +555,8 @@ void BiphasicPairs::model_update(int channel)
             // so both bins are scaled by the same factor (their ratio kept): capping each bin at the value would clip
             // the wider bin, which sits above it by design, and pull a pair on a resistor below its right value.
             // Factor < 1 only: lowers, never raises.
-            const float cap = std::max(2 * MODEL_RESISTANCE_MIN, cur_r * g * GUARD_HOLD);
+            // (v9: from the drive actually used, the estimate x the trim)
+            const float cap = std::max(2 * MODEL_RESISTANCE_MIN, cur_r * cur_k * g * GUARD_HOLD);
             const float r_after = expf((1 - cur_frac) * logf(r_bin[r][b]) + cur_frac * logf(r_bin[r][b + 1]));
             if (r_after > cap) {
                 if (g >= 1) hold_count++;
@@ -512,7 +576,7 @@ void BiphasicPairs::model_update(int channel)
         float num = 0, den = 0, q = 0;
         int used = 0;
         for (int k = 0; k < n_samples; k++) {
-            float c = i_cmd[k][ex];                 // loop current, x direction
+            float c = i_cmd[k][ex] * cur_k;         // loop current, x direction (v9: as trimmed)
             float q_mid = q + 0.5f * c / fs;
             q += c / fs;
             if (phase_of[k] == 0 || std::abs(c) <= MIN_CURRENT_FOR_UPDATE) continue;

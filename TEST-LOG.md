@@ -309,3 +309,33 @@
   both segments verified. That confirms the cause of the failure: Wi-Fi traffic from the remote reaching the STM32
   bootloader through the box's ESP32. The block retries were never exercised on a clean link.
 - Remote's direct Wi-Fi back on; box 2 re-paired over USB (192.168.4.2). The 1 kOhm check (5f.2) is still owed.
+
+## 2026-09-29: box 2 (v8, reflashed v8 by the hub the same morning) tripped twice from the PC player, dry pads
+
+- **18:02, Intense, taper 0.4, 130 us, A 13 / B 24, ~0.10 A body asked on B:**
+  `current limit exceeded (limit 0.580 A primary)`, `meas b -0.582 at sample 5 of 17`, `cmd peak 0.460, route 24`,
+  `r_est 21.66, sigma 0.33 (bin 2 + 1.00), v_drive 11.79 V, scale 1.00`. 1.27x the command; the stock rule allows
+  1 + 0.12 / 0.46 = 1.26x at that command.
+- **18:13, a swinging pattern (width 195-253 us, rate 52-198 Hz, amps swinging 0.037-0.091 A body several times a
+  second), soft square, A 12:** `limit 0.402`, `meas a -0.411 at sample 4 of 23`, `cmd peak 0.282, lead 198 us,
+  shape 2, route 12`, `r_est 27.33, sigma 0.09 (bin 4 + 0.11), v_drive 8.21 V, scale 1.00`. 1.46x.
+- PlaStim was testing without gel (dry pads). Voltage use peaked at 59 %, flux at 65 %: not drive-limited.
+- Reading: on skin the settled sensed / command ratio is ~1.25-1.29 for every shape (sim/v9_explore.py), and the
+  ratio the stock rule allows shrinks as the command grows. v6/v7 correct after a pulse, for the amplitude and width
+  just played; a rising amplitude or a jump to another width bin gets there first. -> v9 (predictive peak guard).
+- Host side the same day: the hub now waits for the box after a fault and reconnects once it is power-cycled.
+
+## 2026-09-29: v9 built (not flashed)
+
+- v9 = the predictive peak guard (NOTES.md, v9). sim/v9_sim.py mirrors it: 0 trips where v8 tripped 1-20 times (the
+  swing reproduces the 18:13 trip), delivered charge within 0.01-0.03 of v8; all 29 sim tests pass.
+- `.pio/build/focstim_v4/firmware.hex` SHA-256 4d0428680c7bdc921c4610359cf7746b740847e5f74dbafbf520e567bbab8787,
+  Flash 61.7 %, RAM 39.0 %. Comment `stim-engine biphasic-pairs v9`. Not flashed; 5g.2 (1 kOhm) before a body.
+
+## 2026-09-29: v9 flashed to box 2
+
+- PlaStim's go. Checked first over USB: engine stopped, box 2 on v8, its Wi-Fi address 0.0.0.0 (not linked to the
+  M5 remote). `flash_focstim.py release/focstim_v4_fork_v9.hex --sha256 4d042868...8787 --port COM17`: erase, write
+  61352 + 100908 B, both segments verified, started: comment `stim-engine biphasic-pairs v9`. No retries.
+- 5g.2 (1 kOhm) not done yet; body tests 5g.3-5g.4 next. v8 (27e44ac1...ec0e) is the image to go back to.
+- 5g.2 (1 kOhm) SKIPPED on PlaStim's call (no resistor to hand), as for v7; body tests 5g.3-5g.4 go ahead.

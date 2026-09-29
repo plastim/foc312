@@ -158,6 +158,15 @@ The sense resistor goes in series with the electrode under test, and moves as th
 | 5f.3 | Body, EMS 1 at the level of 2026-09-28 (rounded, then soft square) | no e-stop; the remote's guard reading ~+0/10 s after the first seconds; note `bp_pk_a`, `bp_rho_a`, `bp_hold` |
 | 5f.4 | Body, triangle and taper 50 % at low level | no e-stop; same strength on a switch (charge-matched); how they feel |
 
+## 5g. v9: predictive peak guard (one 1 kΩ across A-B, then PlaStim's body, dry pads)
+
+| # | Do | Pass |
+|---|---|---|
+| 5g.1 | `firmware_version()` | comment `stim-engine biphasic-pairs v9` |
+| 5g.2 | 1 kΩ: `bench_shapes_widths.py COMx 7` (as 5f.2) | no faults; the same peaks as v8; `bp_trim` stays ~0 after the first pulses of each new shape / width (a resistor sits well under the ceiling), `bp_k_a` ~1.0 |
+| 5g.3 | Body, dry pads: the 18:13 pattern of 2026-09-29 (soft square, the swinging pattern) at the level that tripped | no e-stop; `bp_trim` counts up while the amplitude rises; note `bp_k_a` (how far it trims) and how it feels |
+| 5g.4 | Body: Intense, taper 0.4, 130 us, B on 24 at the level that tripped; then rounded <-> soft square switches | no e-stop; a shape switch is not felt as a jump up |
+
 ## 6. Two pairs, rate and crosstalk (R-1k on both pairs)
 
 | # | Do | Pass |

@@ -324,6 +324,37 @@ v2 (a v1 box gets snapped widths and charge-matched amplitude from the host, as 
   the scope; the charge is right either way.
 - **Cost:** one `cosf` per sample for the rounded shape (a running integral), the same order as v1's `sinf`.
 
+### v9: predictive peak guard (per route x width bin x shape class)
+
+Comment **`stim-engine biphasic-pairs v9`** (host: same features as v7).
+
+- **Why:** box 2, dry pads, 2026-09-29 (TEST-LOG): Intense, taper 0.4, 130 us tripped at 1.27x a 0.46 A command,
+  and a swinging soft-square pattern (width 195-253 us, amplitude swinging 2.5x several times a second) at 1.46x of
+  0.28 A. The stock rule trips at command + 0.12 A, so the ratio it allows shrinks as the command grows (1.26 at
+  0.46 A); on skin loads the settled sensed / command ratio is ~1.25-1.29 for every shape (`sim/v9_explore.py`).
+  v6/v7 correct after a pulse, for the amplitude and width just played; a rising amplitude, a jump to another width
+  bin or a shape switch gets there first.
+- **Model:** per directed route x width bin (nearest of the 7) x shape class (rounded incl. taper <= 0.1, triangle,
+  steep = soft / square / taper), `G` = the largest sensed current on any channel per volt of peak drive, learned
+  after each pulse: up at once, down by `G_DECAY` (0.05) per pulse. A key never measured starts from this
+  direction's largest `G` (else its reverse's) x `G_SEED_MARGIN` (1.5), else from `G0_RATIO` (1.5) x the command at
+  the model's drive, and takes its first measurement as it is (so only its first pulse or so is softer).
+- **Before each pulse**, after the drive / flux limits: `k = min(1, V9_HOLD x (e-stop limit - 0.5 x margin) /
+  (G x planned peak drive))`, `V9_HOLD` 0.95, and the DRIVE (`v_cmd`) is scaled by k. The command `i_cmd` and the
+  e-stop limit stay as requested, exactly as the v6/v7 guard trims through the estimate: lowers only, the e-stop
+  margin is untouched.
+- **With it:** on a trimmed pulse the charge adaptation may lower the estimate, not raise it (it would climb back to
+  undo the trim); the v6/v7 guard and hold compute from the drive actually used (`cur_r x k`); the v5 sigma fit
+  compares against the trimmed command.
+- **Sim** (`sim/v9_sim.py`, mirrors the firmware; `sim/tests/test_v9_sim.py`), trips after pulse 5, v8 -> v9, on
+  700R+47n / 700R+100n / 500R+100n: the swing 20 / 20 / 18 -> 0 (worst 0.88-0.92 of the limit), a step 0.10 ->
+  0.45 A on soft 1 -> 0, rounded <-> soft switches every 50 pulses 4 -> 0; steady high levels unchanged (0 -> 0).
+  Delivered charge within 0.01-0.03 of v8 everywhere. Worth knowing: at high levels on skin loads both v8 and v9
+  deliver only ~0.45-0.8 of the commanded charge (the guard holding under the stock rule); that is headroom the
+  controls don't show.
+- **Diagnostics:** `bp_trim` (pulses trimmed, cumulative), `bp_k_a` / `bp_k_b` (smoothed trim per channel); the trip
+  report's third line ends `trim k`.
+
 ### v8: one model per direction, reverse seeding, where the "any" ceiling is crossed
 
 Comment **`stim-engine biphasic-pairs v8`** (host: same features as v7).
