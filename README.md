@@ -6,8 +6,8 @@ pulse shape, width, rate and polarity set live by the host. Driven by the
 [PlaStim foc312 engine](https://github.com/plastim/foc312-engine) (PC) and the
 [foc312 M5 remote](https://github.com/plastim/foc312-m5remote). The stock modes are unchanged: restim still works.
 
-This firmware is also a **test step for PlaStim Sedecim**, a 16-electrode box in development. The per-pulse
-current model, the guard and the pulse engine are proven here, on the FOC-Stim, before they move there.
+foc312 also shows the ideas behind **PlaStim Sedecim**, a 16-electrode box in development: per-pulse current
+control, shaped pulses, and ET-312 patterns on any electrode pair, working today on the FOC-Stim.
 
 > **Start here:** install the PC app with its
 > **[installation guide](https://github.com/plastim/foc312-engine/blob/main/INSTALL.md)**. It flashes this firmware
