@@ -32,6 +32,45 @@ enum AxisType{
     AXIS_ELECTRODE_2_POWER = 51;
     AXIS_ELECTRODE_3_POWER = 52;
     AXIS_ELECTRODE_4_POWER = 53;
+
+    // --- stim-engine fork: OUTPUT_BIPHASIC_PAIRS (see firmware/NOTES.md) -------------------------------
+    // Two independent channels, A and B, each on an electrode pair (default A = 1-2, B = 3-4; live-routable,
+    // see *_ROUTE below). Each pulse is biphasic:
+    // leading phase, optional gap, return phase. Every setting is charge-balanced by construction: the
+    // return phase carries exactly the leading phase's charge (discrete sums equal, per pulse).
+    // All axes are read at the start of every pulse, so changes (including polarity) take effect on the
+    // next pulse without re-arming. Use MoveTo interval 0 for an instant switch.
+    AXIS_BIPHASIC_A_AMPLITUDE_AMPS = 60;        // body current of the leading phase, 0..0.2 A (x device volume)
+    AXIS_BIPHASIC_B_AMPLITUDE_AMPS = 61;
+    AXIS_BIPHASIC_A_PULSE_FREQUENCY_HZ = 62;    // 1..400 Hz, per pair (pairs run on independent clocks)
+    AXIS_BIPHASIC_B_PULSE_FREQUENCY_HZ = 63;
+    AXIS_BIPHASIC_A_PHASE_WIDTH_US = 64;        // leading phase width, 40..400 us (20 us PWM steps)
+    AXIS_BIPHASIC_B_PHASE_WIDTH_US = 65;
+    AXIS_BIPHASIC_INTERPHASE_GAP_US = 66;       // 0..200 us, both pairs
+    // Leading polarity, live: flip it between pulses (MoveTo interval 0) for a blind lead-swap A/B.
+    // "Cathodic" is in the firmware's current sign convention; which physical terminal that is depends on
+    // transformer phasing and is confirmed on the bench (firmware/TEST-PLAN.md).
+    AXIS_BIPHASIC_A_POLARITY = 67;              // < 0.5: the route's first electrode cathodic in the leading phase; >= 0.5: its second
+    AXIS_BIPHASIC_B_POLARITY = 68;              // (default routes: A electrode 1 vs 2, B electrode 3 vs 4)
+    // Phase asymmetry (ET-312-style unequal phases), live: return width = leading width x asymmetry, rounded to
+    // the 20 us grid (max 400 us x 4); the return amplitude is then set so its charge equals the leading phase's
+    // exactly (~ leading amplitude / asymmetry). 1 = symmetric. Net charge per pair is zero at every setting.
+    AXIS_BIPHASIC_A_ASYMMETRY = 69;             // 1..4
+    AXIS_BIPHASIC_B_ASYMMETRY = 70;
+    // Live routing: which two electrodes each channel drives, as a two-digit code, first electrode then second
+    // (1-based): 12 = electrodes 1-2 (A default), 34 (B default), 23, 41, 13 ... any two different electrodes.
+    // Takes effect on the channel's next pulse, no re-arm. The TARGET value is used (MoveTo never glides through
+    // other routes); an invalid code is ignored. The polarity axis then picks which of the two leads: < 0.5 the
+    // first electrode of the code is cathodic. Both channels may share an electrode or the same pair: their
+    // pulses never overlap in time. A pair not driven for 1 s restarts its impedance estimate low (softer first
+    // pulses for a few pulses, never harder).
+    AXIS_BIPHASIC_A_ROUTE = 71;                 // 11..44 (12)
+    AXIS_BIPHASIC_B_ROUTE = 72;                 // 11..44 (34)
+    // v2 (comment "stim-engine biphasic-pairs v2"): widths are fractional (no 20 us snapping; charge follows the
+    // width continuously) and the phase shape is selectable, live, per channel. The TARGET value is used, rounded.
+    // Amplitude stays = peak current. Unit-peak phase charge: rounded 2w/pi, square w, soft square w - edge.
+    AXIS_BIPHASIC_A_SHAPE = 73;                 // 0 rounded (half-sine, default), 1 square, 2 soft square (20 us edges)
+    AXIS_BIPHASIC_B_SHAPE = 74;
 }
 
 enum BoardIdentifier {
@@ -46,6 +85,7 @@ enum OutputMode {
     OUTPUT_THREEPHASE = 2;
     OUTPUT_FOURPHASE = 3;   // alpha, beta, gamma. DEPRECATED
     OUTPUT_FOURPHASE_INDIVIDUAL_ELECTRODES = 4;  // e1/e2/e3/e4
+    OUTPUT_BIPHASIC_PAIRS = 5;  // stim-engine fork: biphasic pulses on pairs 1-2 and 3-4 (AXIS_BIPHASIC_*)
 }
 
 // TODO: implement

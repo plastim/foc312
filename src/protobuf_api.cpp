@@ -388,6 +388,9 @@ void ProtobufAPI::handle_request_signal_start(focstim_rpc_RequestSignalStart &re
         case focstim_rpc_OutputMode_OUTPUT_FOURPHASE_INDIVIDUAL_ELECTRODES:
         error = signal_start_fourphase_individual_electrodes();
         break;
+        case focstim_rpc_OutputMode_OUTPUT_BIPHASIC_PAIRS:    // stim-engine fork
+        error = signal_start_biphasic_pairs();
+        break;
     }
     focstim_rpc_RpcMessage message = focstim_rpc_RpcMessage_init_zero;
     message.which_message = focstim_rpc_RpcMessage_response_tag;

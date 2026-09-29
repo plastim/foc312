@@ -11,6 +11,7 @@
 #include "signals/threephase_model.h"
 #include "signals/fourphase_math.h"
 #include "signals/fourphase_model.h"
+#include "signals/biphasic_pairs.h"         // stim-engine fork
 #include "battery/power_manager.h"
 #include "battery/boost_control.h"
 #include <Wire.h>
@@ -36,6 +37,7 @@
 Trace trace{};
 ThreephaseModel model3{};
 FourphaseModel model4{};
+BiphasicPairs biphasic{};           // stim-engine fork: OUTPUT_BIPHASIC_PAIRS
 PowerManager power_manager{};
 UserInterface user_interface{};
 ESP32 esp32;
@@ -50,9 +52,11 @@ BoostControl boostControl{};
 enum PlayStatus{
     NotPlaying,
     PlayingThreephase,
-    PlayingFourphase
+    PlayingFourphase,
+    PlayingBiphasicPairs,   // stim-engine fork
 };
 static PlayStatus play_status = PlayStatus::NotPlaying;
+static bool biphasic_restart = true;    // stim-engine fork: re-initialise the per-pair pulse clocks
 
 
 class FocstimV4ProtobufAPI : public ProtobufAPI {
@@ -99,6 +103,21 @@ public:
         boostControl.play_started();
         BSP_WriteLedPattern(LedPattern::PlayingVeryLow);
         play_status = PlayStatus::PlayingFourphase;
+        user_interface.setState(UserInterface::Playing);
+        return focstim_rpc_Errors_ERROR_UNKNOWN;
+    }
+
+    // stim-engine fork: biphasic pulses on two live-routed electrode pairs (AXIS_BIPHASIC_*), see firmware/NOTES.md
+    focstim_rpc_Errors signal_start_biphasic_pairs()
+    {
+        if (play_status != PlayStatus::NotPlaying) {
+            return focstim_rpc_Errors_ERROR_ALREADY_PLAYING;
+        }
+
+        boostControl.play_started();
+        BSP_WriteLedPattern(LedPattern::PlayingVeryLow);
+        biphasic_restart = true;
+        play_status = PlayStatus::PlayingBiphasicPairs;
         user_interface.setState(UserInterface::Playing);
         return focstim_rpc_Errors_ERROR_UNKNOWN;
     }
@@ -214,6 +233,22 @@ struct {
     SimpleAxis e2{focstim_rpc_AxisType_AXIS_ELECTRODE_2_POWER, 0, 0, 1};
     SimpleAxis e3{focstim_rpc_AxisType_AXIS_ELECTRODE_3_POWER, 0, 0, 1};
     SimpleAxis e4{focstim_rpc_AxisType_AXIS_ELECTRODE_4_POWER, 0, 0, 1};
+    // stim-engine fork: OUTPUT_BIPHASIC_PAIRS (channel A default electrodes 1-2, B default 3-4; routes are live)
+    SimpleAxis bp_a_amp{focstim_rpc_AxisType_AXIS_BIPHASIC_A_AMPLITUDE_AMPS, 0, 0, BODY_CURRENT_MAX};
+    SimpleAxis bp_b_amp{focstim_rpc_AxisType_AXIS_BIPHASIC_B_AMPLITUDE_AMPS, 0, 0, BODY_CURRENT_MAX};
+    SimpleAxis bp_a_freq{focstim_rpc_AxisType_AXIS_BIPHASIC_A_PULSE_FREQUENCY_HZ, 50, 1, 400};
+    SimpleAxis bp_b_freq{focstim_rpc_AxisType_AXIS_BIPHASIC_B_PULSE_FREQUENCY_HZ, 50, 1, 400};
+    SimpleAxis bp_a_width{focstim_rpc_AxisType_AXIS_BIPHASIC_A_PHASE_WIDTH_US, 150, 40, 400};
+    SimpleAxis bp_b_width{focstim_rpc_AxisType_AXIS_BIPHASIC_B_PHASE_WIDTH_US, 150, 40, 400};
+    SimpleAxis bp_gap{focstim_rpc_AxisType_AXIS_BIPHASIC_INTERPHASE_GAP_US, 0, 0, 200};
+    SimpleAxis bp_a_pol{focstim_rpc_AxisType_AXIS_BIPHASIC_A_POLARITY, 0, 0, 1};
+    SimpleAxis bp_b_pol{focstim_rpc_AxisType_AXIS_BIPHASIC_B_POLARITY, 0, 0, 1};
+    SimpleAxis bp_a_asym{focstim_rpc_AxisType_AXIS_BIPHASIC_A_ASYMMETRY, 1, 1, 4};
+    SimpleAxis bp_b_asym{focstim_rpc_AxisType_AXIS_BIPHASIC_B_ASYMMETRY, 1, 1, 4};
+    SimpleAxis bp_a_route{focstim_rpc_AxisType_AXIS_BIPHASIC_A_ROUTE, 12, 11, 44};
+    SimpleAxis bp_b_route{focstim_rpc_AxisType_AXIS_BIPHASIC_B_ROUTE, 34, 11, 44};
+    SimpleAxis bp_a_shape{focstim_rpc_AxisType_AXIS_BIPHASIC_A_SHAPE, 0, 0, 5};   // v7: 3 triangle, 4..5 taper
+    SimpleAxis bp_b_shape{focstim_rpc_AxisType_AXIS_BIPHASIC_B_SHAPE, 0, 0, 5};
 } simple_axes;
 
 void trigger_emergency_stop(FOCError error)
@@ -546,10 +581,273 @@ void setup()
 
     model3.init(&trigger_emergency_stop);
     model4.init(&trigger_emergency_stop);
+    biphasic.init(&trigger_emergency_stop);     // stim-engine fork
 
     as5311.init(0.001f, 0.01f);
     imu.init();
     pressureSensor.init();
+}
+
+// stim-engine fork: one scheduler step of OUTPUT_BIPHASIC_PAIRS. Each pair has its own pulse clock; a due pulse
+// is played (blocking, ~0.5-5 ms including the stock 300 us driver/triac turn-on), then telemetry. Only the
+// playing pair's two outputs are enabled. Safety is the stock set: keepalive and the loop()-level checks run
+// before this every time; device volume; BODY_CURRENT_MAX; per-sample over-current e-stop; v_drive and
+// transformer volt-second limits; boost under-voltage e-stop.
+// Route code -> electrode indices. The code is two digits, first electrode then second (1-based): 12, 23, 41 ...
+// The axis TARGET is used, not the interpolated value: a MoveTo with interval > 0 would otherwise glide through
+// other routes (12 -> 41 passes 23, 34 ...), so a route always switches in one step. An invalid code (a digit
+// outside 1-4, or both the same) is ignored and the channel keeps its last valid route.
+static bool decode_route(const SimpleAxis &axis, int &ex, int &ey)
+{
+    int code = int(lroundf(axis.value1));
+    int x = code / 10 - 1, y = code % 10 - 1;
+    if (x < 0 || x > 3 || y < 0 || y > 3 || x == y) {
+        return false;
+    }
+    ex = x;
+    ey = y;
+    return true;
+}
+
+static void biphasic_loop(float vbus, float &v_boost_min, float &v_boost_max)
+{
+    static uint32_t next_due_us[2] = {0, 0};
+    static Clock boost_not_ready_clock;
+    static bool boost_waiting = false;
+    static uint32_t pulse_counter = 0;
+    static Clock rms_current_clock;
+    static Clock actual_pulse_frequency_clock;
+    static float actual_pulse_frequency = 0;
+    static float v_drive_max = 0;
+    static float f_equivalent = 1000;
+    static float last_drive_amps = 0;
+    static float vdrive_slow_start = 5;
+    static uint32_t last_pulse_us = 0;
+    static int route[2][2] = {{0, 1}, {2, 3}};    // [channel][first, second electrode], 0-based
+
+    uint32_t now_us = micros();
+    if (biphasic_restart) {
+        biphasic_restart = false;
+        next_due_us[0] = now_us;
+        next_due_us[1] = now_us;
+        boost_waiting = false;
+        biphasic.reset_totals();
+        biphasic.reset_routes();
+        rms_current_clock.reset();
+        actual_pulse_frequency_clock.reset();
+        vdrive_slow_start = 5;
+        last_pulse_us = now_us;
+    }
+
+    // pick the channel that is due; the more overdue one first
+    int32_t late_a = int32_t(now_us - next_due_us[0]);
+    int32_t late_b = int32_t(now_us - next_due_us[1]);
+    int pair;
+    if (late_a >= 0 && (late_b < 0 || late_a >= late_b)) {
+        pair = 0;
+    } else if (late_b >= 0) {
+        pair = 1;
+    } else {
+        return;
+    }
+
+    // wait for the boost capacitors, same rule as stock (e-stop if it takes more than 100 ms)
+    if (! boostControl.boost_is_ready()) {
+        if (!boost_waiting) {
+            boost_waiting = true;
+            boost_not_ready_clock.reset();
+        }
+        boost_not_ready_clock.step();
+        if (boost_not_ready_clock.time_seconds > 0.1f) {
+            trigger_emergency_stop(FOCError::BOOST_UNDER_VOLTAGE);
+            while (1)
+            {
+                BSP_PrintDebugMsg(
+                    "boost undervoltage detected %.2f. Current boost=%.2f. Restart device to proceed.",
+                    vbus, BSP_ReadVBus());
+                delay(5000);
+            }
+        }
+        return;
+    }
+    boost_waiting = false;
+
+    // parameters are read fresh for every pulse: polarity / asymmetry / width changes apply to the next pulse
+    uint32_t now_ms = millis();
+    float amp_axis  = pair == 0 ? simple_axes.bp_a_amp.get(now_ms)   : simple_axes.bp_b_amp.get(now_ms);
+    float freq      = pair == 0 ? simple_axes.bp_a_freq.get(now_ms)  : simple_axes.bp_b_freq.get(now_ms);
+    float width_us  = pair == 0 ? simple_axes.bp_a_width.get(now_ms) : simple_axes.bp_b_width.get(now_ms);
+    float polarity  = pair == 0 ? simple_axes.bp_a_pol.get(now_ms)   : simple_axes.bp_b_pol.get(now_ms);
+    float asymmetry = pair == 0 ? simple_axes.bp_a_asym.get(now_ms)  : simple_axes.bp_b_asym.get(now_ms);
+    float gap_us    = simple_axes.bp_gap.get(now_ms);
+    {
+        int ex, ey;
+        const SimpleAxis &route_axis = pair == 0 ? simple_axes.bp_a_route : simple_axes.bp_b_route;
+        if (decode_route(route_axis, ex, ey) && (ex != route[pair][0] || ey != route[pair][1])) {
+            route[pair][0] = ex;
+            route[pair][1] = ey;
+            biphasic.net_charge_measured[pair] = 0;
+        }
+    }
+    const int ex = route[pair][0], ey = route[pair][1];
+
+    // keep the pair on its own pulse grid; if we fell behind, restart the grid instead of catching up a backlog
+    uint32_t period_us = uint32_t(1e6f / std::max(freq, 1.f));
+    next_due_us[pair] += period_us;
+    if (int32_t(now_us - next_due_us[pair]) > 0) {
+        next_due_us[pair] = now_us + period_us;
+    }
+
+    // amplitude: axis x device volume, capped at the stock body-current limit
+    float body_current_amps = std::min<float>(amp_axis * encoder.volume(), BODY_CURRENT_MAX);
+    if (!(body_current_amps > 1e-4f)) {
+        return;     // silent pair: no enable, no pulse
+    }
+    float driving_current_amps = body_current_amps * OUTPUT_STAGE.transformer.current_ratio;
+    last_drive_amps = driving_current_amps;
+
+    float volume_percent = body_current_amps / BODY_CURRENT_MAX;
+    if (volume_percent < .02f) {
+        BSP_WriteLedPattern(LedPattern::PlayingVeryLow);
+    } else if (volume_percent < .2f) {
+        BSP_WriteLedPattern(LedPattern::PlayingLow);
+    } else if (volume_percent < .6f) {
+        BSP_WriteLedPattern(LedPattern::PlayingMedium);
+    } else {
+        BSP_WriteLedPattern(LedPattern::PlayingHigh);
+    }
+
+    BiphasicPairs::PulseParams params{};
+    params.amplitude = driving_current_amps;
+    params.phase_width_s = width_us * 1e-6f;
+    params.gap_s = gap_us * 1e-6f;
+    params.asymmetry = asymmetry;
+    // shape: the axis TARGET (like the route: a MoveTo never glides through the other shapes). 0..3 rounded to the
+    // enum; 4.0..5.0 = SHAPE_TAPER with the flat-top fraction in the fraction (v7)
+    {
+        float sv = pair == 0 ? simple_axes.bp_a_shape.value1 : simple_axes.bp_b_shape.value1;
+        if (sv >= 3.5f) {
+            params.shape = BiphasicPairs::SHAPE_TAPER;
+            params.shape_param = std::clamp(sv - 4.f, 0.f, 1.f);
+        } else {
+            params.shape = int(lroundf(sv));
+            params.shape_param = 0;
+        }
+    }
+    params.ex = ex;
+    params.ey = ey;
+    params.swap_polarity = polarity >= 0.5f;
+    params.estop_current_limit = driving_current_amps + ESTOP_CURRENT_LIMIT_MARGIN;
+    // slow start in time as well as per pulse. Stock BoostControl limits the drive-voltage rise to 0.5 V per pulse,
+    // which at stock's <= 100 Hz is <= 50 V/s; this mode can pulse several times faster, so also cap it at 50 V/s.
+    float dt_since_last_pulse = std::min<float>((now_us - last_pulse_us) * 1e-6f, 0.01f);
+    last_pulse_us = now_us;
+    float v_drive_wanted = biphasic.begin_route(ex, ey, width_us * 1e-6f * float(STIM_PWM_FREQ), now_ms) * driving_current_amps;
+    vdrive_slow_start = std::clamp(v_drive_wanted + 1.f, vdrive_slow_start,
+                                   vdrive_slow_start + std::min(0.5f, 50.f * dt_since_last_pulse));
+    float max_vdrive = std::min(boostControl.max_allowed_vdrive(), vdrive_slow_start);
+    OutputLimits output_limits(max_vdrive, MODEL_MAXIMUM_VOLT_SECONDS, MODEL_FIXED_RESISTANCE);
+
+    BSP_OutputEnable(ex == 0 || ey == 0, ex == 1 || ey == 1, ex == 2 || ey == 2, ex == 3 || ey == 3);
+    delayMicroseconds(300); // the minimum of DRV8231A turnon time (datasheet: 250us) and triac turnon time (experimental: 300us)
+    BSP_AdjustCurrentSenseOffsets();
+    biphasic.play_pulse(pair, params, output_limits);
+    BSP_DisableOutputs();
+    boostControl.update(biphasic.stats.v_drive_requested, biphasic.stats.v_bus_min);
+
+    // stats
+    pulse_counter++;
+    actual_pulse_frequency_clock.step();
+    actual_pulse_frequency = lerp(.05f, actual_pulse_frequency,
+                                  1e6f / std::max<uint32_t>(actual_pulse_frequency_clock.dt_micros, 1));
+    v_drive_max = std::max(v_drive_max, biphasic.stats.v_drive_actual);
+    v_boost_min = std::min(v_boost_min, biphasic.stats.v_bus_min);
+    v_boost_max = std::max(v_boost_max, biphasic.stats.v_bus_max);
+    f_equivalent = 1.f / (2.f * std::max(width_us, 40.f) * 1e-6f);  // a half-sine phase of width w ~ 1/(2w) Hz
+
+    // notifications, staggered every 50 pulses (both channels counted) like stock. The model is resistive per
+    // electrode pair; each electrode is reported as half the loop resistance of the channel route it is on
+    // (channel A's route if it is on both; 0 if it is on neither).
+    const float current_ratio = OUTPUT_STAGE.transformer.current_ratio;
+    Complex ze[4];
+    for (int c = 1; c >= 0; c--) {
+        float r_half = biphasic.route_resistance(route[c][0], route[c][1]) * 0.5f;
+        ze[route[c][0]] = Complex(r_half, 0);
+        ze[route[c][1]] = Complex(r_half, 0);
+    }
+    if (pulse_counter % 50 == 0) {
+        rms_current_clock.step();
+        auto rms = biphasic.estimate_rms_current(rms_current_clock.dt_seconds);
+        float power_total =
+            OUTPUT_STAGE.power_total(rms.a, ze[0], f_equivalent) + OUTPUT_STAGE.power_total(rms.b, ze[1], f_equivalent) +
+            OUTPUT_STAGE.power_total(rms.c, ze[2], f_equivalent) + OUTPUT_STAGE.power_total(rms.d, ze[3], f_equivalent);
+        float power_skin =
+            OUTPUT_STAGE.power_skin(rms.a, ze[0], f_equivalent) + OUTPUT_STAGE.power_skin(rms.b, ze[1], f_equivalent) +
+            OUTPUT_STAGE.power_skin(rms.c, ze[2], f_equivalent) + OUTPUT_STAGE.power_skin(rms.d, ze[3], f_equivalent);
+        protobuf.transmit_notification_currents(
+            rms.a / current_ratio, rms.b / current_ratio, rms.c / current_ratio, rms.d / current_ratio,
+            biphasic.total_current_max[0] / current_ratio, biphasic.total_current_max[1] / current_ratio,
+            biphasic.total_current_max[2] / current_ratio, biphasic.total_current_max[3] / current_ratio,
+            power_total, power_skin,
+            last_drive_amps / current_ratio);
+        for (int i = 0; i < 4; i++) {
+            biphasic.total_current_max[i] = 0;
+            biphasic.total_current_squared[i] = 0;
+        }
+    }
+    if (pulse_counter % 50 == 10) {
+        protobuf.transmit_notification_output_resistance(
+            ze[0].real(), 0, ze[1].real(), 0, ze[2].real(), 0, ze[3].real(), 0);
+    }
+    if (pulse_counter % 50 == 20) {
+        Complex s[4];
+        for (int e = 0; e < 4; e++) {
+            s[e] = ze[e].real() > 0 ? OUTPUT_STAGE.body_impedance(ze[e], f_equivalent) : Complex(0, 0);
+        }
+        protobuf.transmit_notification_skin_resistance(
+            s[0].real(), s[0].imag(), s[1].real(), s[1].imag(), s[2].real(), s[2].imag(), s[3].real(), s[3].imag());
+    }
+    if (pulse_counter % 50 == 30) {
+        // measured (lead - return) charge per pair, body side, microcoulombs, leaky ~100 pulses. Should hover
+        // near 0; a steady offset means the two sense channels disagree (see NOTES.md), not that DC flows.
+        protobuf.transmit_notification_debug_teleplot("bp_qnet_a_uC", biphasic.net_charge_measured[0] / current_ratio * 1e6f);
+        protobuf.transmit_notification_debug_teleplot("bp_qnet_b_uC", biphasic.net_charge_measured[1] / current_ratio * 1e6f);
+        // v5 series-RC term of each channel's current route (0 = resistive; see NOTES.md v5)
+        protobuf.transmit_notification_debug_teleplot("bp_sigma_a", biphasic.route_sigma(route[0][0], route[0][1]));
+        protobuf.transmit_notification_debug_teleplot("bp_sigma_b", biphasic.route_sigma(route[1][0], route[1][1]));
+        // v6: pulses so far where the peak guard lowered an estimate
+        protobuf.transmit_notification_debug_teleplot("bp_guard", float(biphasic.guard_count));
+    }
+    if (pulse_counter % 50 == 45) {
+        // v7 guard diagnostics: events by ceiling, climb holds, and per channel the sensed / commanded lead peak and
+        // lead charge (smoothed) and the route's loop-resistance estimate
+        protobuf.transmit_notification_debug_teleplot("bp_guard_lead", float(biphasic.guard_lead_count));
+        protobuf.transmit_notification_debug_teleplot("bp_guard_any", float(biphasic.guard_any_count));
+        protobuf.transmit_notification_debug_teleplot("bp_hold", float(biphasic.hold_count));
+        protobuf.transmit_notification_debug_teleplot("bp_pk_a", biphasic.diag_pk_ratio[0]);
+        protobuf.transmit_notification_debug_teleplot("bp_pk_b", biphasic.diag_pk_ratio[1]);
+        protobuf.transmit_notification_debug_teleplot("bp_rho_a", biphasic.diag_rho[0]);
+        protobuf.transmit_notification_debug_teleplot("bp_rho_b", biphasic.diag_rho[1]);
+        protobuf.transmit_notification_debug_teleplot("bp_r_a", biphasic.route_resistance(route[0][0], route[0][1]));
+        protobuf.transmit_notification_debug_teleplot("bp_r_b", biphasic.route_resistance(route[1][0], route[1][1]));
+    }
+    if (pulse_counter % 50 == 5) {
+        // v8: where the "any" ceiling was crossed (lead / return / first 3 samples / other), and reverse seeds
+        protobuf.transmit_notification_debug_teleplot("bp_any_lead", float(biphasic.any_lead_count));
+        protobuf.transmit_notification_debug_teleplot("bp_any_ret", float(biphasic.any_return_count));
+        protobuf.transmit_notification_debug_teleplot("bp_any_start", float(biphasic.any_start_count));
+        protobuf.transmit_notification_debug_teleplot("bp_any_other", float(biphasic.any_other_count));
+        protobuf.transmit_notification_debug_teleplot("bp_rev_seed", float(biphasic.reverse_seed_count));
+    }
+    if (pulse_counter % 50 == 40) {
+        protobuf.transmit_notification_signal_stats(
+            actual_pulse_frequency,
+            v_drive_max,
+            std::min(1.f, biphasic.total_volt_seconds / MODEL_MAXIMUM_VOLT_SECONDS),
+            std::min(1.f, boostControl.utilizaton_percent(v_drive_max)));
+        biphasic.total_volt_seconds = 0;
+        v_drive_max = 0;
+    }
 }
 
 void loop()
@@ -702,6 +1000,12 @@ void loop()
         user_interface.setState(UserInterface::Idle);
         boostControl.play_stopped();
         imu.stop_stream();
+        return;
+    }
+
+    // stim-engine fork: the biphasic-pairs mode has its own per-pair scheduler
+    if (play_status == PlayStatus::PlayingBiphasicPairs) {
+        biphasic_loop(vbus, v_boost_min, v_boost_max);
         return;
     }
 
