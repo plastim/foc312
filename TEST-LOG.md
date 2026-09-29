@@ -339,3 +339,11 @@
   61352 + 100908 B, both segments verified, started: comment `stim-engine biphasic-pairs v9`. No retries.
 - 5g.2 (1 kOhm) not done yet; body tests 5g.3-5g.4 next. v8 (27e44ac1...ec0e) is the image to go back to.
 - 5g.2 (1 kOhm) SKIPPED on PlaStim's call (no resistor to hand), as for v7; body tests 5g.3-5g.4 go ahead.
+
+## 2026-09-29: v9 body test on box 2 (5g.3-5g.4), dry pads
+
+- PlaStim, ~10 min (20:18-20:28 UTC) from the PC player at the settings that tripped v8 earlier: **no trips, no
+  faults** ("no crash").
+- v9 counters over the session: `bp_trim` 16749 pulses trimmed, smoothed trim `bp_k_a` >= 0.88, `bp_k_b` >= 0.82 (at
+  most ~12-18 % less drive at the peaks); the after-pulse guard fired 8 times in all (`bp_guard` 8, `bp_guard_any` 1);
+  `bp_hold` 5747.
